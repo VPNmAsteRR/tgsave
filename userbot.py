@@ -311,7 +311,13 @@ class Saver:
                 cached = None
             if cached is not None:
                 await self.send_text(head)
-                await self.client.forward_messages(TARGET, cached)
+                forwarded = await self.client.forward_messages(TARGET, cached)
+                if isinstance(forwarded, list):
+                    forwarded = forwarded[0] if forwarded else None
+                if forwarded is not None:
+                    self.journal.set_copy(
+                        row["chat_id"], row["message_id"], forwarded.id, self.target_id
+                    )
                 try:
                     await self.client.delete_messages(source, [copy_id])
                 except Exception:
