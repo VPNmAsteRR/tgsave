@@ -1,0 +1,28 @@
+[Unit]
+Description=tgsave menu bot (inline navigation over the archive)
+After=network-online.target tgsave.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgsave
+Group=tgsave
+WorkingDirectory=/opt/tgsave
+EnvironmentFile=/etc/tgsave.env
+ExecStart=/opt/tgsave/venv/bin/python /opt/tgsave/menu.py
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/tgsave
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

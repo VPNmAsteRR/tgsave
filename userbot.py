@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS saved (
     message_id INTEGER NOT NULL,
     sender     TEXT,
     kind       TEXT,
+    tag        TEXT,
+    text       TEXT,
     status     TEXT,
     ts         INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id)
@@ -81,7 +83,7 @@ def sender_tag(sender):
     """
     username = getattr(sender, "username", None)
     raw = f"from_{username}" if username else f"from_id{getattr(sender, 'id', 'unknown')}"
-    return re.sub(r"[^0-9A-Za-z_]", "_", raw).lower()[:64]
+    return re.sub(r"[^0-9A-Za-z_]", "_", raw).lower()[:40]
 
 
 class Journal:
@@ -92,13 +94,23 @@ class Journal:
         self.db.executescript(SCHEMA)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.commit()
+        self._migrate()
 
-    def claim(self, chat_id, message_id, sender, kind):
+    def _migrate(self):
+        """Добавляет колонки в журнал, созданный прошлой версией."""
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(saved)")}
+        for name in ("tag", "text"):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE saved ADD COLUMN {name} TEXT")
+        self.db.commit()
+
+    def claim(self, chat_id, message_id, sender, kind, tag, text):
         """Атомарно занять сообщение. False — уже обрабатывали."""
         cur = self.db.execute(
-            "INSERT OR IGNORE INTO saved (chat_id, message_id, sender, kind, status, ts) "
-            "VALUES (?,?,?,?,'pending',?)",
-            (chat_id, message_id, sender, kind, int(time.time())),
+            "INSERT OR IGNORE INTO saved "
+            "(chat_id, message_id, sender, kind, tag, text, status, ts) "
+            "VALUES (?,?,?,?,?,?,'pending',?)",
+            (chat_id, message_id, sender, kind, tag, text, int(time.time())),
         )
         self.db.commit()
         return cur.rowcount > 0
@@ -114,6 +126,13 @@ class Journal:
         return self.db.execute(
             "SELECT * FROM saved WHERE chat_id=? AND message_id=?", (chat_id, message_id)
         ).fetchone()
+
+    def update_text(self, chat_id, message_id, text):
+        self.db.execute(
+            "UPDATE saved SET text=? WHERE chat_id=? AND message_id=?",
+            (text, chat_id, message_id),
+        )
+        self.db.commit()
 
     def add_edit(self, chat_id, message_id, text):
         self.db.execute(
@@ -188,12 +207,12 @@ class Saver:
 
         sender = await event.get_sender()
         kind = self.kind(msg)
-        if not self.journal.claim(chat_id, msg.id, display(sender), kind):
+        tag = sender_tag(sender)
+        if not self.journal.claim(chat_id, msg.id, display(sender), kind, tag, msg.text or ""):
             return
 
         head = await self.header(event)
         try:
-            tag = sender_tag(sender)
             if self.journal.add_sender(
                 tag, display(sender), getattr(sender, "username", None)
             ):
@@ -242,6 +261,7 @@ class Saver:
         head = await self.header(event, edited=True)
         text = msg.text or ""
         self.journal.add_edit(event.chat_id, msg.id, text)
+        self.journal.update_text(event.chat_id, msg.id, text)
         if text:
             await self.send_text(f"{head}\n\n{html.escape(text)}")
         else:
