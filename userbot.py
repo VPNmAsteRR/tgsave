@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Userbot: копирует входящие личные сообщения в заданный чат.
+"""Userbot: в чат бота попадает только то, что исчезло.
 
-Работает под аккаунтом пользователя (MTProto), поэтому видит обычные личные
-переписки — в отличие от бота, которому Telegram отдаёт только чаты с его
-участием.
+Каждое входящее личное сообщение тихо учитывается: текст — в журнал, медиа —
+копией-документом в CACHE-чате (по умолчанию «Избранное»). В TARGET (чат бота)
+уходит только исчезнувшее:
 
-Медиа скачивается во временный файл, отправляется документом (байт-в-байт,
-без пережатия) и сразу удаляется с диска. Одноразовые медиа сохраняются до
-истечения таймера, правки приходят отдельным сообщением.
+- сообщение, которое собеседник удалил у всех (🗑);
+- одноразовое фото/видео с таймером (🔥), которое исчезнет само.
+
+Так архив в чате бота не забивается обычной перепиской.
 """
 
 import asyncio
@@ -24,11 +25,13 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION = os.environ.get("SESSION", "session")
 TARGET = os.environ.get("TARGET", "me")
+CACHE = os.environ.get("CACHE", "me")
 DATA_DIR = os.environ.get("DATA_DIR", "/var/lib/tgsave")
 TMP_DIR = os.path.join(DATA_DIR, "tmp")
 DB_PATH = os.path.join(DATA_DIR, "saved.db")
 
 CAPTION_LIMIT = 900
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS saved (
     chat_id    INTEGER NOT NULL,
@@ -38,6 +41,9 @@ CREATE TABLE IF NOT EXISTS saved (
     tag        TEXT,
     text       TEXT,
     copy_id    INTEGER,
+    cache_chat INTEGER,
+    surfaced   INTEGER NOT NULL DEFAULT 0,
+    reason     TEXT,
     status     TEXT,
     ts         INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id)
@@ -55,12 +61,13 @@ CREATE TABLE IF NOT EXISTS senders (
     first_seen INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS requests (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    copy_id INTEGER,
-    chat_id INTEGER,
-    path    TEXT,
-    error   TEXT,
-    ts      INTEGER
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    copy_id     INTEGER,
+    chat_id     INTEGER,
+    source_chat INTEGER,
+    path        TEXT,
+    error       TEXT,
+    ts          INTEGER
 );
 """
 
@@ -69,8 +76,11 @@ def log(*args):
     print(time.strftime("%H:%M:%S"), *args, file=sys.stderr, flush=True)
 
 
+def stamp(ts):
+    return time.strftime("%d.%m %H:%M", time.localtime(ts))
+
+
 def display(entity):
-    """Человеческое имя отправителя для шапки копии."""
     if entity is None:
         return "?"
     name = " ".join(
@@ -85,58 +95,64 @@ def display(entity):
 
 
 def sender_tag(sender):
-    """Тег для поиска всех копий одного отправителя.
-
-    Telegram разрешает в хэштегах латиницу, цифры и подчёркивание, поэтому
-    недопустимые символы заменяются, а тег всегда начинается с буквы.
-    """
+    """Тег для поиска копий одного отправителя: #from_username / #from_id123."""
     username = getattr(sender, "username", None)
     raw = f"from_{username}" if username else f"from_id{getattr(sender, 'id', 'unknown')}"
     return re.sub(r"[^0-9A-Za-z_]", "_", raw).lower()[:40]
 
 
 class Journal:
-    """Учёт сохранённых сообщений: дедупликация и поиск для событий удаления."""
-
     def __init__(self, path):
-        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db = sqlite3.connect(path, check_same_thread=False, timeout=10)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.commit()
         self._migrate()
 
     def _migrate(self):
-        """Добавляет колонки в журнал, созданный прошлой версией."""
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(saved)")}
-        for name in ("tag", "text", "copy_id"):
+        types = {
+            "tag": "TEXT",
+            "text": "TEXT",
+            "copy_id": "INTEGER",
+            "cache_chat": "INTEGER",
+            "surfaced": "INTEGER NOT NULL DEFAULT 0",
+            "reason": "TEXT",
+        }
+        for name, sql_type in types.items():
             if name not in columns:
-                kind = "INTEGER" if name == "copy_id" else "TEXT"
-                self.db.execute(f"ALTER TABLE saved ADD COLUMN {name} {kind}")
+                self.db.execute(f"ALTER TABLE saved ADD COLUMN {name} {sql_type}")
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(requests)")}
+        if "source_chat" not in columns:
+            self.db.execute("ALTER TABLE requests ADD COLUMN source_chat INTEGER")
         self.db.commit()
 
     def claim(self, chat_id, message_id, sender, kind, tag, text):
-        """Атомарно занять сообщение. False — уже обрабатывали."""
         cur = self.db.execute(
             "INSERT OR IGNORE INTO saved "
             "(chat_id, message_id, sender, kind, tag, text, status, ts) "
-            "VALUES (?,?,?,?,?,?,'pending',?)",
+            "VALUES (?,?,?,?,?,?,'tracked',?)",
             (chat_id, message_id, sender, kind, tag, text, int(time.time())),
         )
         self.db.commit()
         return cur.rowcount > 0
 
-    def finish(self, chat_id, message_id, status, copy_id=None):
+    def set_copy(self, chat_id, message_id, copy_id, cache_chat):
         self.db.execute(
-            "UPDATE saved SET status=?, copy_id=COALESCE(?, copy_id) "
-            "WHERE chat_id=? AND message_id=?",
-            (status, copy_id, chat_id, message_id),
+            "UPDATE saved SET copy_id=?, cache_chat=? WHERE chat_id=? AND message_id=?",
+            (copy_id, cache_chat, chat_id, message_id),
         )
         self.db.commit()
 
-    def find(self, chat_id, message_id):
-        return self.db.execute(
-            "SELECT * FROM saved WHERE chat_id=? AND message_id=?", (chat_id, message_id)
-        ).fetchone()
+    def mark_surfaced(self, chat_id, message_id, reason):
+        self.db.execute(
+            "UPDATE saved SET surfaced=1, reason=?, status='shown' "
+            "WHERE chat_id=? AND message_id=?",
+            (reason, chat_id, message_id),
+        )
+        self.db.commit()
 
     def update_text(self, chat_id, message_id, text):
         self.db.execute(
@@ -145,16 +161,31 @@ class Journal:
         )
         self.db.commit()
 
-    def add_edit(self, chat_id, message_id, text):
-        self.db.execute(
-            "INSERT INTO edits (chat_id, message_id, new_text, ts) VALUES (?,?,?,?)",
-            (chat_id, message_id, text, int(time.time())),
+    def find(self, chat_id, message_id):
+        return self.db.execute(
+            "SELECT * FROM saved WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        ).fetchone()
+
+    def find_by_id(self, message_id):
+        rows = self.db.execute(
+            "SELECT * FROM saved WHERE message_id=?", (message_id,)
+        ).fetchall()
+        return rows[0] if len(rows) == 1 else None
+
+    def add_sender(self, tag, name, username):
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO senders (tag, name, username, first_seen) "
+            "VALUES (?,?,?,?)",
+            (tag, name, username, int(time.time())),
         )
         self.db.commit()
+        return cur.rowcount > 0
 
     def pending_requests(self):
         return self.db.execute(
-            "SELECT id, copy_id FROM requests WHERE path IS NULL AND error IS NULL"
+            "SELECT id, copy_id, source_chat FROM requests "
+            "WHERE path IS NULL AND error IS NULL"
         ).fetchall()
 
     def set_request_path(self, request_id, path):
@@ -170,18 +201,8 @@ class Journal:
         )
         self.db.commit()
 
-    def add_sender(self, tag, name, username):
-        """True — отправитель встретился впервые."""
-        cur = self.db.execute(
-            "INSERT OR IGNORE INTO senders (tag, name, username, first_seen) VALUES (?,?,?,?)",
-            (tag, name, username, int(time.time())),
-        )
-        self.db.commit()
-        return cur.rowcount > 0
-
 
 def split_text(text, limit=3900):
-    """Режет длинный текст под лимит Telegram, не разрывая строки без нужды."""
     chunks, current = [], ""
     for line in text.split("\n"):
         while len(line) > limit:
@@ -198,7 +219,6 @@ def split_text(text, limit=3900):
 
 
 def trimmed(text, limit):
-    """HTML-escaped текст, обрезанный под лимит с многоточием."""
     body = html.escape(text)
     if len(body) <= limit:
         return body
@@ -206,30 +226,31 @@ def trimmed(text, limit):
 
 
 class Saver:
-    def __init__(self, client, journal, target_id):
+    def __init__(self, client, journal, target_id, cache_id):
         self.client = client
         self.journal = journal
         self.target_id = target_id
+        self.cache_id = cache_id
 
-    async def header(self, event, edited=False):
-        sender = await event.get_sender()
-        stamp = time.strftime("%d.%m %H:%M", time.localtime(event.message.date.timestamp()))
-        line = f"📥 <b>{html.escape(display(sender))}</b>"
-        username = getattr(sender, "username", None)
+    def sender(self, tag):
+        row = self.journal.db.execute(
+            "SELECT name, username FROM senders WHERE tag=?", (tag,)
+        ).fetchone()
+        return (row["name"], row["username"]) if row else (tag, None)
+
+    def head(self, tag, ts, label):
+        name, username = self.sender(tag)
+        line = f"{label} · <b>{html.escape(name or '?')}</b>"
         if username:
             line += f" · @{html.escape(username)}"
-        line += f" · {stamp}"
-        if edited:
-            line += " · ✏️ изменено"
-        return f"{line}\n#{sender_tag(sender)}"
+        line += f" · {stamp(ts)}"
+        return f"{line}\n#{tag}"
 
     async def handle(self, event):
         msg = event.message
         chat_id = event.chat_id
 
-        # Не копируем то, что и так лежит в целевом чате: иначе бот с
-        # автоответом и TARGET на его чат дают бесконечную петлю.
-        if chat_id == self.target_id:
+        if chat_id == self.target_id or chat_id == self.cache_id:
             return
         if msg.action is not None:
             return
@@ -237,69 +258,71 @@ class Saver:
         sender = await event.get_sender()
         kind = self.kind(msg)
         tag = sender_tag(sender)
-        if not self.journal.claim(chat_id, msg.id, display(sender), kind, tag, msg.text or ""):
-            return
-
-        head = await self.header(event)
-        copy_id = None
-        try:
-            if self.journal.add_sender(
-                tag, display(sender), getattr(sender, "username", None)
-            ):
-                await self.send_text(
-                    f"📇 <b>{html.escape(display(sender))}</b> → #{tag}\n"
-                    f"<i>тап по тегу — все копии от него</i>"
-                )
-            if msg.media:
-                path = await self.download(event)
-                if path:
-                    caption = head
-                    if msg.text:
-                        room = CAPTION_LIMIT - len(head) - 2
-                        caption = f"{head}\n\n{trimmed(msg.text, room)}"
-                    try:
-                        sent = await self.client.send_file(
-                            TARGET,
-                            path,
-                            caption=caption,
-                            parse_mode="html",
-                            force_document=True,
-                        )
-                        copy_id = sent.id
-                    finally:
-                        os.remove(path)
-                else:
-                    sent = await self.send_text(f"{head}\n\n<i>[{kind}: файл не скачался]</i>")
-                    copy_id = sent[0].id if sent else None
-            elif msg.text:
-                sent = await self.send_text(f"{head}\n\n{html.escape(msg.text)}")
-                copy_id = sent[0].id if sent else None
-            else:
-                sent = await self.send_text(f"{head}\n\n<i>[{kind}]</i>")
-                copy_id = sent[0].id if sent else None
-            self.journal.finish(chat_id, msg.id, "sent", copy_id)
-        except Exception as exc:
-            log(f"save {chat_id}/{msg.id} failed: {type(exc).__name__}: {exc}")
-            self.journal.finish(chat_id, msg.id, f"error:{type(exc).__name__}")
-            try:
-                await self.send_text(
-                    f"{head}\n\n<i>[не сохранено: {html.escape(str(exc))[:200]}]</i>"
-                )
-            except Exception:
-                pass
-
-    async def handle_edit(self, event):
-        if event.chat_id == self.target_id:
-            return
-        msg = event.message
-        head = await self.header(event, edited=True)
         text = msg.text or ""
-        self.journal.add_edit(event.chat_id, msg.id, text)
-        self.journal.update_text(event.chat_id, msg.id, text)
-        if text:
-            await self.send_text(f"{head}\n\n{html.escape(text)}")
-        else:
-            await self.send_text(f"{head}\n\n<i>[подпись изменена]</i>")
+        if not self.journal.claim(chat_id, msg.id, display(sender), kind, tag, text):
+            return
+
+        view_once = bool(getattr(msg.media, "ttl_seconds", None)) if msg.media else False
+        self.journal.add_sender(tag, display(sender), getattr(sender, "username", None))
+
+        if msg.media:
+            path = await self.download(event)
+            if path:
+                caption = f"📥 <b>{html.escape(display(sender))}</b>"
+                username = getattr(sender, "username", None)
+                if username:
+                    caption += f" · @{html.escape(username)}"
+                caption += f" · {stamp(msg.date.timestamp())}\n#{tag}"
+                if text:
+                    room = CAPTION_LIMIT - len(caption) - 2
+                    caption = f"{caption}\n\n{trimmed(text, room)}"
+                try:
+                    sent = await self.client.send_file(
+                        CACHE,
+                        path,
+                        caption=caption,
+                        parse_mode="html",
+                        force_document=True,
+                    )
+                    self.journal.set_copy(chat_id, msg.id, sent.id, self.cache_id)
+                finally:
+                    os.remove(path)
+            else:
+                log(f"media {chat_id}/{msg.id} not downloaded")
+
+        if view_once:
+            row = self.journal.find(chat_id, msg.id)
+            await self.surface(row, "view_once")
+
+    async def surface(self, row, reason):
+        if row is None or row["surfaced"]:
+            return
+
+        label = "🗑 <b>Удалено</b>" if reason == "deleted" else "🔥 <b>Одноразовое</b>"
+        head = self.head(row["tag"], row["ts"], label)
+
+        copy_id = row["copy_id"]
+        if copy_id:
+            source = row["cache_chat"] or self.cache_id
+            try:
+                cached = await self.client.get_messages(source, ids=copy_id)
+            except Exception as exc:
+                log(f"cache fetch failed: {type(exc).__name__}: {exc}")
+                cached = None
+            if cached is not None:
+                await self.send_text(head)
+                await self.client.forward_messages(TARGET, cached)
+                try:
+                    await self.client.delete_messages(source, [copy_id])
+                except Exception:
+                    pass
+                self.journal.mark_surfaced(row["chat_id"], row["message_id"], reason)
+                return
+
+        text = row["text"] or ""
+        body = f"\n\n{html.escape(text)}" if text else "\n\n<i>[копия недоступна]</i>"
+        await self.send_text(f"{head}{body}")
+        self.journal.mark_surfaced(row["chat_id"], row["message_id"], reason)
 
     async def download(self, event):
         try:
@@ -359,25 +382,28 @@ def secure_session():
         os.chmod(path, 0o600)
 
 
-async def serve_requests(client, target, journal):
-    """Отдаёт меню-боту файлы копий по запросу: скачивает и кладёт путь в журнал."""
+async def serve_requests(client, journal, target):
+    """Отдаёт меню-боту файлы копий: скачивает из кэша и кладёт путь в журнал."""
     while True:
         try:
-            for request_id, copy_id in journal.pending_requests():
+            for request in journal.pending_requests():
                 try:
-                    message = await client.get_messages(target, ids=copy_id)
+                    source = request["source_chat"] or target.id
+                    message = await client.get_messages(source, ids=request["copy_id"])
                     if message is None or not message.media:
                         raise RuntimeError("no media in copy")
                     path = await client.download_media(
-                        message, file=os.path.join(TMP_DIR, f"req_{request_id}")
+                        message, file=os.path.join(TMP_DIR, f"req_{request['id']}")
                     )
-                    if not journal.set_request_path(request_id, path):
+                    if not journal.set_request_path(request["id"], path):
                         os.remove(path)
                         continue
-                    log(f"media request {request_id} ready: {os.path.basename(path)}")
+                    log(f"media request {request['id']} ready")
                 except Exception as exc:
-                    log(f"media request {request_id} failed: {type(exc).__name__}: {exc}")
-                    journal.set_request_error(request_id, f"{type(exc).__name__}: {exc}")
+                    log(f"media request {request['id']} failed: {type(exc).__name__}: {exc}")
+                    journal.set_request_error(
+                        request["id"], f"{type(exc).__name__}: {exc}"
+                    )
         except Exception as exc:
             log("request loop failed:", type(exc).__name__, exc)
         await asyncio.sleep(1)
@@ -403,10 +429,13 @@ async def main():
 
     me = await client.get_me()
     target = await client.get_entity(TARGET)
-    log(f"userbot @{me.username or me.id} -> {TARGET} (id {target.id})")
+    cache = await client.get_entity(CACHE)
+    log(f"userbot @{me.username or me.id}: кэш {CACHE} (id {cache.id}), бот {TARGET} (id {target.id})")
+    if cache.id == target.id:
+        log("ВНИМАНИЕ: CACHE и TARGET совпадают — в чат будут попадать все сообщения")
 
-    saver = Saver(client, journal, target.id)
-    asyncio.create_task(serve_requests(client, target, journal))
+    saver = Saver(client, journal, target.id, cache.id)
+    asyncio.create_task(serve_requests(client, journal, target))
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def on_new(event):
@@ -414,15 +443,28 @@ async def main():
 
     @client.on(events.MessageEdited(incoming=True, func=lambda e: e.is_private))
     async def on_edit(event):
-        await saver.handle_edit(event)
+        if event.chat_id in (saver.target_id, saver.cache_id):
+            return
+        msg = event.message
+        text = msg.text or ""
+        journal.update_text(event.chat_id, msg.id, text)
+        if msg.media:
+            journal.db.execute(
+                "UPDATE saved SET text=? WHERE chat_id=? AND message_id=?",
+                (text, event.chat_id, msg.id),
+            )
+            journal.db.commit()
 
     @client.on(events.MessageDeleted)
     async def on_deleted(event):
-        if event.chat_id is None:
+        if event.chat_id in (saver.target_id, saver.cache_id):
             return
         for message_id in event.deleted_ids:
-            if journal.find(event.chat_id, message_id):
-                log(f"deleted {event.chat_id}/{message_id} (копия сохранена)")
+            row = journal.find(event.chat_id, message_id) if event.chat_id else None
+            if row is None:
+                row = journal.find_by_id(message_id)
+            if row is not None:
+                await saver.surface(row, "deleted")
 
     await client.run_until_disconnected()
 

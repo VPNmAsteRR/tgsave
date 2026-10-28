@@ -86,10 +86,10 @@ class Store:
         )
         self.db.commit()
 
-    def add_request(self, copy_id, chat_id):
+    def add_request(self, copy_id, chat_id, source_chat):
         cur = self.db.execute(
-            "INSERT INTO requests (copy_id, chat_id, ts) VALUES (?,?,?)",
-            (copy_id, chat_id, int(time.time())),
+            "INSERT INTO requests (copy_id, chat_id, source_chat, ts) VALUES (?,?,?,?)",
+            (copy_id, chat_id, source_chat, int(time.time())),
         )
         self.db.commit()
         return cur.lastrowid
@@ -113,7 +113,7 @@ class Store:
             SELECT s.tag, s.name, s.username,
                    COUNT(v.message_id) AS n, MAX(v.ts) AS last
             FROM senders s
-            JOIN saved v ON v.tag = s.tag AND v.status = 'sent'
+            JOIN saved v ON v.tag = s.tag AND v.surfaced = 1
             GROUP BY s.tag
             ORDER BY last DESC
             """
@@ -121,15 +121,15 @@ class Store:
 
     def count(self, tag):
         row = self.db.execute(
-            "SELECT COUNT(*) AS n FROM saved WHERE tag=? AND status='sent'", (tag,)
+            "SELECT COUNT(*) AS n FROM saved WHERE tag=? AND surfaced=1", (tag,)
         ).fetchone()
         return row["n"]
 
     def messages(self, tag, limit, offset):
         return self.db.execute(
             """
-            SELECT message_id, ts, kind, text, copy_id FROM saved
-            WHERE tag=? AND status='sent'
+            SELECT message_id, ts, kind, text, copy_id, cache_chat, reason FROM saved
+            WHERE tag=? AND surfaced=1
             ORDER BY ts DESC, message_id DESC
             LIMIT ? OFFSET ?
             """,
@@ -138,14 +138,14 @@ class Store:
 
     def message(self, tag, message_id):
         return self.db.execute(
-            "SELECT message_id, ts, kind, text, copy_id FROM saved "
-            "WHERE tag=? AND message_id=? AND status='sent'",
+            "SELECT message_id, ts, kind, text, copy_id, cache_chat, reason FROM saved "
+            "WHERE tag=? AND message_id=? AND surfaced=1",
             (tag, message_id),
         ).fetchone()
 
     def totals(self):
         row = self.db.execute(
-            "SELECT COUNT(*) AS n FROM saved WHERE status='sent'"
+            "SELECT COUNT(*) AS n FROM saved WHERE surfaced=1"
         ).fetchone()
         return row["n"]
 
@@ -201,9 +201,9 @@ def sender_label(row):
 def menu_text(store):
     senders = store.senders()
     return (
-        "📂 <b>Архив сообщений</b>\n"
-        f"Копий: {store.totals()} · отправителей: {len(senders)}\n\n"
-        "Выбери, чьи сообщения показать:"
+        "🗑 <b>Исчезнувшие сообщения</b>\n"
+        f"Всего: {store.totals()} · отправителей: {len(senders)}\n\n"
+        "Удалённые и одноразовые. Выбери отправителя:"
     )
 
 
@@ -281,7 +281,8 @@ def sender_text(store, tag, page):
 
 def detail_text(row, tag, page):
     icon = ICONS.get(row["kind"], "💬")
-    head = f"{icon} <b>{esc(row['kind'])}</b> · {stamp(row['ts'])}"
+    reason = "🗑 удалено" if (row["reason"] or "deleted") == "deleted" else "🔥 одноразовое"
+    head = f"{icon} <b>{esc(row['kind'])}</b> · {reason} · {stamp(row['ts'])}"
     text = esc(row["text"] or "").strip()
     if len(text) > TEXT_LIMIT:
         text = text[:TEXT_LIMIT] + "…"
@@ -386,7 +387,7 @@ class Menu:
         if not copy_id:
             return
 
-        request_id = self.store.add_request(copy_id, chat_id)
+        request_id = self.store.add_request(copy_id, chat_id, row["cache_chat"])
         try:
             request = None
             deadline = time.time() + 15
