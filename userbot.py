@@ -13,6 +13,7 @@
 import asyncio
 import html
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -44,6 +45,12 @@ CREATE TABLE IF NOT EXISTS edits (
     new_text   TEXT,
     ts         INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS senders (
+    tag        TEXT PRIMARY KEY,
+    name       TEXT,
+    username   TEXT,
+    first_seen INTEGER NOT NULL
+);
 """
 
 
@@ -64,6 +71,17 @@ def display(entity):
         or (f"@{entity.username}" if getattr(entity, "username", None) else None)
         or str(getattr(entity, "id", "?"))
     )
+
+
+def sender_tag(sender):
+    """Тег для поиска всех копий одного отправителя.
+
+    Telegram разрешает в хэштегах латиницу, цифры и подчёркивание, поэтому
+    недопустимые символы заменяются, а тег всегда начинается с буквы.
+    """
+    username = getattr(sender, "username", None)
+    raw = f"from_{username}" if username else f"from_id{getattr(sender, 'id', 'unknown')}"
+    return re.sub(r"[^0-9A-Za-z_]", "_", raw).lower()[:64]
 
 
 class Journal:
@@ -104,6 +122,15 @@ class Journal:
         )
         self.db.commit()
 
+    def add_sender(self, tag, name, username):
+        """True — отправитель встретился впервые."""
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO senders (tag, name, username, first_seen) VALUES (?,?,?,?)",
+            (tag, name, username, int(time.time())),
+        )
+        self.db.commit()
+        return cur.rowcount > 0
+
 
 def split_text(text, limit=3900):
     """Режет длинный текст под лимит Telegram, не разрывая строки без нужды."""
@@ -136,15 +163,17 @@ class Saver:
         self.journal = journal
         self.target_id = target_id
 
-    async def header(self, event):
+    async def header(self, event, edited=False):
         sender = await event.get_sender()
         stamp = time.strftime("%d.%m %H:%M", time.localtime(event.message.date.timestamp()))
-        parts = [f"📥 <b>{html.escape(display(sender))}</b>"]
+        line = f"📥 <b>{html.escape(display(sender))}</b>"
         username = getattr(sender, "username", None)
         if username:
-            parts.append(f"@{html.escape(username)}")
-        parts.append(stamp)
-        return " · ".join(parts)
+            line += f" · @{html.escape(username)}"
+        line += f" · {stamp}"
+        if edited:
+            line += " · ✏️ изменено"
+        return f"{line}\n#{sender_tag(sender)}"
 
     async def handle(self, event):
         msg = event.message
@@ -164,6 +193,14 @@ class Saver:
 
         head = await self.header(event)
         try:
+            tag = sender_tag(sender)
+            if self.journal.add_sender(
+                tag, display(sender), getattr(sender, "username", None)
+            ):
+                await self.send_text(
+                    f"📇 <b>{html.escape(display(sender))}</b> → #{tag}\n"
+                    f"<i>тап по тегу — все копии от него</i>"
+                )
             if msg.media:
                 path = await self.download(event)
                 if path:
@@ -202,8 +239,7 @@ class Saver:
         if event.chat_id == self.target_id:
             return
         msg = event.message
-        head = await self.header(event)
-        head = head.replace(" · ", " · ✏️ ", 1) + " · изменено"
+        head = await self.header(event, edited=True)
         text = msg.text or ""
         self.journal.add_edit(event.chat_id, msg.id, text)
         if text:
