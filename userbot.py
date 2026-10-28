@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS saved (
     kind       TEXT,
     tag        TEXT,
     text       TEXT,
+    copy_id    INTEGER,
     status     TEXT,
     ts         INTEGER NOT NULL,
     PRIMARY KEY (chat_id, message_id)
@@ -52,6 +53,14 @@ CREATE TABLE IF NOT EXISTS senders (
     name       TEXT,
     username   TEXT,
     first_seen INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS requests (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    copy_id INTEGER,
+    chat_id INTEGER,
+    path    TEXT,
+    error   TEXT,
+    ts      INTEGER
 );
 """
 
@@ -99,9 +108,10 @@ class Journal:
     def _migrate(self):
         """Добавляет колонки в журнал, созданный прошлой версией."""
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(saved)")}
-        for name in ("tag", "text"):
+        for name in ("tag", "text", "copy_id"):
             if name not in columns:
-                self.db.execute(f"ALTER TABLE saved ADD COLUMN {name} TEXT")
+                kind = "INTEGER" if name == "copy_id" else "TEXT"
+                self.db.execute(f"ALTER TABLE saved ADD COLUMN {name} {kind}")
         self.db.commit()
 
     def claim(self, chat_id, message_id, sender, kind, tag, text):
@@ -115,10 +125,11 @@ class Journal:
         self.db.commit()
         return cur.rowcount > 0
 
-    def finish(self, chat_id, message_id, status):
+    def finish(self, chat_id, message_id, status, copy_id=None):
         self.db.execute(
-            "UPDATE saved SET status=? WHERE chat_id=? AND message_id=?",
-            (status, chat_id, message_id),
+            "UPDATE saved SET status=?, copy_id=COALESCE(?, copy_id) "
+            "WHERE chat_id=? AND message_id=?",
+            (status, copy_id, chat_id, message_id),
         )
         self.db.commit()
 
@@ -138,6 +149,24 @@ class Journal:
         self.db.execute(
             "INSERT INTO edits (chat_id, message_id, new_text, ts) VALUES (?,?,?,?)",
             (chat_id, message_id, text, int(time.time())),
+        )
+        self.db.commit()
+
+    def pending_requests(self):
+        return self.db.execute(
+            "SELECT id, copy_id FROM requests WHERE path IS NULL AND error IS NULL"
+        ).fetchall()
+
+    def set_request_path(self, request_id, path):
+        cur = self.db.execute(
+            "UPDATE requests SET path=? WHERE id=?", (path, request_id)
+        )
+        self.db.commit()
+        return cur.rowcount > 0
+
+    def set_request_error(self, request_id, error):
+        self.db.execute(
+            "UPDATE requests SET error=? WHERE id=?", (error[:300], request_id)
         )
         self.db.commit()
 
@@ -212,6 +241,7 @@ class Saver:
             return
 
         head = await self.header(event)
+        copy_id = None
         try:
             if self.journal.add_sender(
                 tag, display(sender), getattr(sender, "username", None)
@@ -228,22 +258,26 @@ class Saver:
                         room = CAPTION_LIMIT - len(head) - 2
                         caption = f"{head}\n\n{trimmed(msg.text, room)}"
                     try:
-                        await self.client.send_file(
+                        sent = await self.client.send_file(
                             TARGET,
                             path,
                             caption=caption,
                             parse_mode="html",
                             force_document=True,
                         )
+                        copy_id = sent.id
                     finally:
                         os.remove(path)
                 else:
-                    await self.send_text(f"{head}\n\n<i>[{kind}: файл не скачался]</i>")
+                    sent = await self.send_text(f"{head}\n\n<i>[{kind}: файл не скачался]</i>")
+                    copy_id = sent[0].id if sent else None
             elif msg.text:
-                await self.send_text(f"{head}\n\n{html.escape(msg.text)}")
+                sent = await self.send_text(f"{head}\n\n{html.escape(msg.text)}")
+                copy_id = sent[0].id if sent else None
             else:
-                await self.send_text(f"{head}\n\n<i>[{kind}]</i>")
-            self.journal.finish(chat_id, msg.id, "sent")
+                sent = await self.send_text(f"{head}\n\n<i>[{kind}]</i>")
+                copy_id = sent[0].id if sent else None
+            self.journal.finish(chat_id, msg.id, "sent", copy_id)
         except Exception as exc:
             log(f"save {chat_id}/{msg.id} failed: {type(exc).__name__}: {exc}")
             self.journal.finish(chat_id, msg.id, f"error:{type(exc).__name__}")
@@ -275,10 +309,14 @@ class Saver:
             return None
 
     async def send_text(self, text):
+        sent = []
         for chunk in split_text(text):
-            await self.client.send_message(
-                TARGET, chunk, parse_mode="html", link_preview=False
+            sent.append(
+                await self.client.send_message(
+                    TARGET, chunk, parse_mode="html", link_preview=False
+                )
             )
+        return sent
 
     @staticmethod
     def kind(msg):
@@ -321,6 +359,30 @@ def secure_session():
         os.chmod(path, 0o600)
 
 
+async def serve_requests(client, target, journal):
+    """Отдаёт меню-боту файлы копий по запросу: скачивает и кладёт путь в журнал."""
+    while True:
+        try:
+            for request_id, copy_id in journal.pending_requests():
+                try:
+                    message = await client.get_messages(target, ids=copy_id)
+                    if message is None or not message.media:
+                        raise RuntimeError("no media in copy")
+                    path = await client.download_media(
+                        message, file=os.path.join(TMP_DIR, f"req_{request_id}")
+                    )
+                    if not journal.set_request_path(request_id, path):
+                        os.remove(path)
+                        continue
+                    log(f"media request {request_id} ready: {os.path.basename(path)}")
+                except Exception as exc:
+                    log(f"media request {request_id} failed: {type(exc).__name__}: {exc}")
+                    journal.set_request_error(request_id, f"{type(exc).__name__}: {exc}")
+        except Exception as exc:
+            log("request loop failed:", type(exc).__name__, exc)
+        await asyncio.sleep(1)
+
+
 async def main():
     prepare_dirs()
     secure_session()
@@ -344,6 +406,7 @@ async def main():
     log(f"userbot @{me.username or me.id} -> {TARGET} (id {target.id})")
 
     saver = Saver(client, journal, target.id)
+    asyncio.create_task(serve_requests(client, target, journal))
 
     @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def on_new(event):

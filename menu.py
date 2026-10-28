@@ -25,6 +25,16 @@ PAGE_SENDERS = 6
 PAGE_MESSAGES = 8
 TEXT_LIMIT = 3500
 
+MEDIA_METHOD = {
+    "photo": "sendPhoto",
+    "video": "sendVideo",
+    "animation": "sendAnimation",
+    "voice": "sendVoice",
+    "audio": "sendAudio",
+    "document": "sendDocument",
+    "video_note": "sendVideoNote",
+}
+
 ICONS = {
     "photo": "🖼",
     "video": "🎬",
@@ -61,9 +71,41 @@ class Store:
     """Только чтение журнала userbot-а."""
 
     def __init__(self, path):
-        self.db = sqlite3.connect(path, check_same_thread=False, timeout=5)
+        self.db = sqlite3.connect(
+            path, check_same_thread=False, timeout=5, isolation_level=None
+        )
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA busy_timeout=5000")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS requests ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, copy_id INTEGER, chat_id INTEGER, "
+            "path TEXT, error TEXT, ts INTEGER)"
+        )
+        self.db.execute(
+            "DELETE FROM requests WHERE ts < ?", (int(time.time()) - 600,)
+        )
+        self.db.commit()
+
+    def add_request(self, copy_id, chat_id):
+        cur = self.db.execute(
+            "INSERT INTO requests (copy_id, chat_id, ts) VALUES (?,?,?)",
+            (copy_id, chat_id, int(time.time())),
+        )
+        self.db.commit()
+        return cur.lastrowid
+
+    def request(self, request_id):
+        return self.db.execute(
+            "SELECT * FROM requests WHERE id=?", (request_id,)
+        ).fetchone()
+
+    def drop_request(self, request_id):
+        self.db.execute("DELETE FROM requests WHERE id=?", (request_id,))
+        self.db.commit()
+
+    def name(self, tag):
+        row = self.db.execute("SELECT name, username FROM senders WHERE tag=?", (tag,)).fetchone()
+        return (row["name"], row["username"]) if row else (tag, None)
 
     def senders(self):
         return self.db.execute(
@@ -86,7 +128,7 @@ class Store:
     def messages(self, tag, limit, offset):
         return self.db.execute(
             """
-            SELECT message_id, ts, kind, text FROM saved
+            SELECT message_id, ts, kind, text, copy_id FROM saved
             WHERE tag=? AND status='sent'
             ORDER BY ts DESC, message_id DESC
             LIMIT ? OFFSET ?
@@ -96,7 +138,7 @@ class Store:
 
     def message(self, tag, message_id):
         return self.db.execute(
-            "SELECT message_id, ts, kind, text FROM saved "
+            "SELECT message_id, ts, kind, text, copy_id FROM saved "
             "WHERE tag=? AND message_id=? AND status='sent'",
             (tag, message_id),
         ).fetchone()
@@ -119,6 +161,31 @@ class Api:
         if not data.get("ok"):
             raise RuntimeError(f"{method}: {data.get('description')}")
         return data["result"]
+
+    async def download(self, file_id):
+        """Скачивает файл бота (лимит Bot API — 20 МБ)."""
+        try:
+            info = await self.call("getFile", file_id=file_id)
+        except RuntimeError as exc:
+            log("getFile failed:", exc)
+            return None
+        url = f"https://api.telegram.org/file/bot{TOKEN}/{info['file_path']}"
+        response = await self.http.get(url)
+        if response.status_code != 200:
+            log("download failed:", response.status_code)
+            return None
+        return response.content
+
+    async def upload(self, method, field, chat_id, data, caption, filename):
+        response = await self.http.post(
+            f"{self.base}/{method}",
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+            files={field: (filename, data)},
+        )
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError(f"{method}: {payload.get('description')}")
+        return payload["result"]
 
     async def close(self):
         await self.http.aclose()
@@ -212,17 +279,17 @@ def sender_text(store, tag, page):
     return f"{head}\n{body}", {"inline_keyboard": keyboard}
 
 
-def detail_text(store, tag, message_id, page):
-    row = store.message(tag, message_id)
-    if row is None:
-        return "Сообщение не найдено", {"inline_keyboard": [[{"text": "↩️ Назад", "callback_data": f"s|{tag}|{page}"}]]}
-
+def detail_text(row, tag, page):
     icon = ICONS.get(row["kind"], "💬")
     head = f"{icon} <b>{esc(row['kind'])}</b> · {stamp(row['ts'])}"
     text = esc(row["text"] or "").strip()
     if len(text) > TEXT_LIMIT:
         text = text[:TEXT_LIMIT] + "…"
-    body = text or "<i>без текста — медиа лежит в чате выше</i>"
+    body = text or (
+        "<i>без текста — медиа отправляю отдельным сообщением</i>"
+        if row["kind"] != "text"
+        else "<i>пусто</i>"
+    )
     keyboard = {
         "inline_keyboard": [[{"text": "↩️ К списку", "callback_data": f"s|{tag}|{page}"}]]
     }
@@ -266,6 +333,7 @@ class Menu:
     async def on_message(self, message):
         if message.get("from", {}).get("id") != OWNER_ID:
             return
+
         text = (message.get("text") or "").strip().lower()
         if text.startswith("/start") or text.startswith("/menu"):
             await self.show_menu(message["chat"]["id"])
@@ -284,6 +352,7 @@ class Menu:
         parts = (callback.get("data") or "").split("|")
         kind = parts[0] if parts else ""
 
+        row = None
         if kind == "m":
             page = int(parts[1]) if len(parts) > 1 else 0
             text = menu_text(self.store)
@@ -291,13 +360,88 @@ class Menu:
         elif kind == "s" and len(parts) >= 3:
             text, markup = sender_text(self.store, parts[1], int(parts[2]))
         elif kind == "d" and len(parts) >= 4:
-            text, markup = detail_text(self.store, parts[1], int(parts[2]), int(parts[3]))
+            tag, page = parts[1], int(parts[3])
+            row = self.store.message(tag, int(parts[2]))
+            if row is None:
+                text = "Сообщение не найдено"
+                markup = {
+                    "inline_keyboard": [
+                        [{"text": "↩️ Назад", "callback_data": f"s|{tag}|{page}"}]
+                    ]
+                }
+            else:
+                text, markup = detail_text(row, tag, page)
         else:
             await self.api.call("answerCallbackQuery", callback_query_id=callback_id)
             return
 
         await self.api.call("answerCallbackQuery", callback_query_id=callback_id)
         await self.render(chat_id, message_id, text, markup)
+        if row is not None:
+            asyncio.create_task(self.show_media(chat_id, parts[1], row))
+
+    async def show_media(self, chat_id, tag, row):
+        """Просит userbot отдать файл копии и отправляет его от имени бота."""
+        copy_id = row["copy_id"]
+        if not copy_id:
+            return
+
+        request_id = self.store.add_request(copy_id, chat_id)
+        try:
+            request = None
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                request = self.store.request(request_id)
+                if request is None:
+                    return
+                if request["error"] or request["path"]:
+                    break
+                await asyncio.sleep(0.5)
+
+            if request is None or request["error"]:
+                log("media request failed:", request["error"] if request else "gone")
+                return
+            if not request["path"]:
+                log("media request timed out")
+                return
+
+            path = request["path"]
+            try:
+                with open(path, "rb") as handle:
+                    data = handle.read()
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+            name, username = self.store.name(tag)
+            caption = f"👤 <b>{esc(name)}</b>"
+            if username:
+                caption += f" · @{esc(username)}"
+            caption += f" · {stamp(row['ts'])}"
+
+            if row["kind"] in ("photo", "video"):
+                is_photo = row["kind"] == "photo"
+                try:
+                    await self.api.upload(
+                        "sendPhoto" if is_photo else "sendVideo",
+                        "photo" if is_photo else "video",
+                        chat_id,
+                        data,
+                        caption,
+                        "photo.jpg" if is_photo else "video.mp4",
+                    )
+                    return
+                except RuntimeError as exc:
+                    log("media upload failed, sending as document:", exc)
+            await self.api.upload(
+                "sendDocument", "document", chat_id, data, caption, "file"
+            )
+        except Exception as exc:
+            log("media failed:", type(exc).__name__, exc)
+        finally:
+            self.store.drop_request(request_id)
 
 
 async def poll(api, menu):
