@@ -1,0 +1,26 @@
+# Секреты и состояние — в репозиторий не попадает
+.env
+*.env
+!deploy/tgsave.env.example
+*.session
+*.session-journal
+login.json
+*.db
+*.db-wal
+*.db-shm
+data/
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+
+# Редакторы и ОС
+.DS_Store
+.idea/
+.vscode/
+*.swp
